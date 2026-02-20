@@ -41,10 +41,13 @@ import traceback
 # ⚠️ Khuyến nghị: đặt token qua biến môi trường để tránh lộ token khi share code
 # Linux/Mac:  export BOT_TOKEN="123:ABC..."
 # Windows:    setx BOT_TOKEN "123:ABC..."
-TOKEN ="8505111864:AAFXhTkT5scTv4ulEFpgpxoVYqEGnogoF1k"
-OWNER_ID = "8208489603"
-YOUR_USERNAME = "@taolailove2"
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOKEN") or ""
+OWNER_ID = int(os.getenv("OWNER_ID", "8208489603"))
+YOUR_USERNAME = os.getenv("YOUR_USERNAME", "@taolailove2")
 
+if not TOKEN:
+    raise RuntimeError("❌ Thiếu BOT_TOKEN/TELEGRAM_BOT_TOKEN. Hãy set biến môi trường chứa token bot Telegram.")
+# Cấu hình thư mục
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
 IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
@@ -84,6 +87,9 @@ SPAM_WINDOW_SECONDS = 10
 SPAM_FILE_UPLOAD_LIMIT = 3  # số lần upload tối đa
 SPAM_FILE_UPLOAD_WINDOW = 60  # giây
 SPAM_PENALTY_MINUTES = 10  # ban tạm nếu spam nhiều lần
+SPAM_CHAT_MSG_LIMIT = 15  # 15 tin nhắn / 1 phút
+SPAM_CHAT_MSG_WINDOW = 60  # giây
+SPAM_CHAT_MSG_BAN_MINUTES = 30  # ban 30 phút nếu spam tin nhắn
 
 # Cấu hình Antivirus/Anti-botnet (heuristic)
 MAX_ZIP_EXTRACT_MB = 100  # giới hạn tổng dung lượng giải nén để chống zip bomb
@@ -1401,89 +1407,232 @@ captcha_manager = CaptchaManager()
 
 # ==================== BOT SCRIPT MANAGER NÂNG CAO ====================
 class BotScriptManager:
+    """
+    Quản lý chạy script (.py/.js) theo user, có:
+    - Run/Stop + lưu log
+    - Monitor process (cleanup khi chết)
+    - Defensive limits (Linux): rlimit + kill nếu vượt RAM / spawn quá nhiều process
+    - Enforce coin: hết coin -> auto stop (trừ admin/owner hoặc file đang treo)
+    """
+
     def __init__(self):
         self.running_scripts: Dict[str, Dict] = {}
         self.lock = threading.RLock()
-        # lưu lịch sử auto-restart để chống loop crash
+
+        # lịch sử auto-restart để chống loop crash
         self.restart_history: Dict[str, deque] = defaultdict(deque)
+
+        # thread monitor / coin enforcer
         self.monitor_thread = threading.Thread(target=self._monitor_scripts, daemon=True)
         self.monitor_thread.start()
+
         self.coin_thread = threading.Thread(target=self._coin_enforcer_loop, daemon=True)
         self.coin_thread.start()
 
-def _make_preexec_limits(self):
-    """Chỉ áp dụng trên Linux/Unix: giới hạn tài nguyên để tránh 'cắn RAM' / fork bomb."""
-    if os.name == 'nt' or resource is None:
-        return None
+    # --------- helpers ---------
+    def _key(self, user_id: int, file_name: str) -> str:
+        return f"{user_id}:{file_name}"
 
-    def _preexec():
-        try:
-            os.setsid()
-        except Exception:
-            pass
-        try:
-            if hasattr(resource, 'RLIMIT_NPROC'):
-                resource.setrlimit(resource.RLIMIT_NPROC, (MAX_SCRIPT_CHILDREN, MAX_SCRIPT_CHILDREN))
-        except Exception:
-            pass
-        try:
-            if hasattr(resource, 'RLIMIT_FSIZE'):
-                resource.setrlimit(resource.RLIMIT_FSIZE, (50 * 1024 * 1024, 50 * 1024 * 1024))
-        except Exception:
-            pass
-        try:
-            if hasattr(resource, 'RLIMIT_CPU'):
-                resource.setrlimit(resource.RLIMIT_CPU, (MAX_SCRIPT_CPU_SECONDS, MAX_SCRIPT_CPU_SECONDS))
-        except Exception:
-            pass
-        try:
-            if hasattr(resource, 'RLIMIT_AS'):
-                lim = int(MAX_SCRIPT_RSS_MB) * 1024 * 1024
-                resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
-        except Exception:
-            pass
+    def _is_pin_active(self, pin_until: Optional[datetime]) -> bool:
+        return bool(pin_until and pin_until > datetime.now())
 
-    return _preexec
+    def _make_preexec_limits(self):
+        """Linux/Unix only: giới hạn tài nguyên để chống RAM bomb / fork bomb."""
+        if os.name == 'nt' or resource is None:
+            return None
 
-def _coin_enforcer_loop(self):
-    while True:
+        def _preexec():
+            # tách group để kill tree dễ hơn
+            try:
+                os.setsid()
+            except Exception:
+                pass
+
+            # giới hạn số process con
+            try:
+                if hasattr(resource, 'RLIMIT_NPROC'):
+                    resource.setrlimit(resource.RLIMIT_NPROC, (MAX_SCRIPT_CHILDREN, MAX_SCRIPT_CHILDREN))
+            except Exception:
+                pass
+
+            # giới hạn dung lượng file tạo ra (50MB)
+            try:
+                if hasattr(resource, 'RLIMIT_FSIZE'):
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (50 * 1024 * 1024, 50 * 1024 * 1024))
+            except Exception:
+                pass
+
+            # giới hạn CPU time
+            try:
+                if hasattr(resource, 'RLIMIT_CPU'):
+                    resource.setrlimit(resource.RLIMIT_CPU, (MAX_SCRIPT_CPU_SECONDS, MAX_SCRIPT_CPU_SECONDS))
+            except Exception:
+                pass
+
+            # giới hạn address space (RAM ảo)
+            try:
+                if hasattr(resource, 'RLIMIT_AS'):
+                    lim = int(MAX_SCRIPT_RSS_MB) * 1024 * 1024
+                    resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+            except Exception:
+                pass
+
+        return _preexec
+
+    def _kill_process_tree(self, info: Dict):
+        proc = info.get("process")
+        pid = info.get("pid") or (proc.pid if proc else None)
+        if not pid:
+            return
         try:
-            if not AUTO_STOP_WHEN_COINS_EMPTY:
-                time.sleep(30)
-                continue
-
-            with self.lock:
-                items = list(self.running_scripts.items())
-
-            for script_key, info in items:
+            p = psutil.Process(pid)
+        except Exception:
+            return
+        # kill children first
+        try:
+            for c in p.children(recursive=True):
                 try:
-                    uid = int(info.get('user_id'))
-                    fname = info.get('file_name')
-                    if not uid or not fname:
-                        continue
-                    if db.is_admin(uid):
-                        continue
-                    u = db.get_user(uid)
-                    if not u:
-                        continue
-                    if u.balance > 0:
-                        continue
-                    pin_until = db.get_file_pinned_until(uid, fname)
-                    if is_pin_active(pin_until):
-                        continue
-                    self.stop_script(uid, fname)
-                    try:
-                        bot.send_message(uid, f"⛔ Hết coin nên hệ thống đã dừng `{fname}`.", parse_mode='Markdown')
-                    except Exception:
-                        pass
+                    c.kill()
                 except Exception:
                     pass
         except Exception:
             pass
-        time.sleep(20)
+        try:
+            p.kill()
+        except Exception:
+            pass
 
+    def _cleanup_script(self, script_key: str):
+        """Xóa khỏi running_scripts và cập nhật DB."""
+        with self.lock:
+            info = self.running_scripts.pop(script_key, None)
+
+        if not info:
+            return
+
+        try:
+            lf = info.get("log_file")
+            if lf:
+                try:
+                    lf.flush()
+                except Exception:
+                    pass
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            db.update_file_status(int(info.get("user_id")), info.get("file_name"), False, None)
+        except Exception:
+            pass
+
+    def is_running(self, user_id: int, file_name: str) -> bool:
+        script_key = self._key(user_id, file_name)
+        with self.lock:
+            info = self.running_scripts.get(script_key)
+        if not info:
+            return False
+        proc = info.get("process")
+        if not proc:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            return False
+
+    # --------- start / stop ---------
+    def _start_process(self, user_id: int, folder: str, file_name: str, cmd: List[str]) -> Tuple[bool, str]:
+        script_key = self._key(user_id, file_name)
+
+        script_path = os.path.join(folder, file_name)
+        if not os.path.exists(script_path):
+            return False, "❌ Không tìm thấy file."
+
+        if self.is_running(user_id, file_name):
+            return False, "⚠️ Script đang chạy rồi."
+
+        # log file
+        log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
+        try:
+            log_file = open(log_path, "a", encoding="utf-8", errors="ignore")
+        except Exception as e:
+            return False, f"❌ Không mở được log: {e}"
+
+        preexec = self._make_preexec_limits()
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=folder,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                preexec_fn=preexec,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+            return False, f"❌ Không thể chạy script: {e}"
+
+        info = {
+            "user_id": user_id,
+            "file_name": file_name,
+            "type": "py" if cmd and cmd[0].startswith("python") else "js",
+            "start_time": datetime.now(),
+            "process": proc,
+            "pid": proc.pid,
+            "log_path": log_path,
+            "log_file": log_file,
+        }
+
+        with self.lock:
+            self.running_scripts[script_key] = info
+
+        try:
+            db.update_file_status(user_id, file_name, True, proc.pid)
+        except Exception:
+            pass
+
+        return True, "✅ Đã chạy!"
+
+    def run_python_script(self, user_id: int, file_name: str) -> Tuple[bool, str]:
+        folder = get_user_folder(user_id)
+        return self._start_process(user_id, folder, file_name, ["python", file_name])
+
+    def run_js_script(self, user_id: int, file_name: str) -> Tuple[bool, str]:
+        folder = get_user_folder(user_id)
+        # ưu tiên node
+        return self._start_process(user_id, folder, file_name, ["node", file_name])
+
+    def stop_script(self, user_id: int, file_name: str) -> Tuple[bool, str]:
+        script_key = self._key(user_id, file_name)
+        with self.lock:
+            info = self.running_scripts.get(script_key)
+        if not info:
+            # fallback: update db in case stale
+            try:
+                db.update_file_status(user_id, file_name, False, None)
+            except Exception:
+                pass
+            return False, "⚠️ Script không chạy."
+
+        try:
+            self._kill_process_tree(info)
+        except Exception:
+            pass
+
+        self._cleanup_script(script_key)
+        return True, "🛑 Đã dừng."
+
+    # --------- monitor / restart / enforce ---------
     def _restart_allowed(self, script_key: str, max_restarts: int = 5, window_seconds: int = 600) -> bool:
-        """Giới hạn auto-restart để tránh loop crash."""
         now = time.time()
         dq = self.restart_history[script_key]
         while dq and now - dq[0] > window_seconds:
@@ -1493,615 +1642,180 @@ def _coin_enforcer_loop(self):
         dq.append(now)
         return True
 
-    def _spawn_script_process(self, script_path: str, user_id: int, folder: str, file_name: str, script_type: str, reason: str = "") -> bool:
-        """Spawn process (không gửi reply). Dùng cho auto-restart."""
-        try:
-            if not os.path.exists(script_path):
-                return False
-
-            if self.is_running(user_id, file_name):
-                return False
-
-            # Tạo file log
-            log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
-            log_file = open(log_path, 'a', encoding='utf-8', errors='ignore')
-            tag = "AUTO-RESTART" if reason else "BẮT ĐẦU"
-            log_file.write(f"\n--- {tag} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {reason} ---\n")
-            log_file.flush()
-
-            # Chạy script
-            startupinfo = None
-            creationflags = 0
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                creationflags = subprocess.CREATE_NO_WINDOW
-
-            cmd = [sys.executable, script_path] if script_type == 'py' else ['node', script_path]
-            process = subprocess.Popen(
-                cmd,
-                cwd=folder,
-                stdout=log_file,
-                stderr=log_file,
-                stdin=subprocess.PIPE,
-                startupinfo=startupinfo,
-                encoding='utf-8',
-                errors='ignore',
-                preexec_fn=self._make_preexec_limits(),
-                creationflags=creationflags
-            )
-
-            script_key = f"{user_id}_{file_name}"
-            with self.lock:
-                self.running_scripts[script_key] = {
-                    'process': process,
-                    'log_file': log_file,
-                    'file_name': file_name,
-                    'user_id': user_id,
-                    'start_time': datetime.now(),
-                    'folder': folder,
-                    'type': script_type,
-                    'pid': process.pid
-                }
-
-            db.update_file_status(user_id, file_name, True, process.pid)
-            return True
-        except Exception as e:
-            logger.error(f"Lỗi spawn process {user_id}_{file_name}: {e}")
-            return False
-
-    def _maybe_auto_restart(self, script_key: str, last_info: Dict):
-        """Nếu file đang TREO còn hạn -> tự restart khi crash."""
-        try:
-            user_id = last_info.get('user_id')
-            file_name = last_info.get('file_name')
-            folder = last_info.get('folder') or os.path.join(UPLOAD_BOTS_DIR, str(user_id))
-            script_type = last_info.get('type') or ('py' if str(file_name).endswith('.py') else 'js')
-
-            if not user_id or not file_name:
-                return
-
-            # kiểm tra treo còn hạn
-            pin_until = db.get_file_pinned_until(user_id, file_name)
-            if not pin_until or pin_until <= datetime.now():
-                return
-
-            script_path = os.path.join(folder, file_name)
-            if not os.path.exists(script_path):
-                # file mất -> hủy treo
-                try:
-                    db.clear_file_pin(user_id, file_name)
-                except Exception:
-                    pass
-                return
-
-            if not self._restart_allowed(script_key):
-                try:
-                    bot.send_message(
-                        user_id,
-                        f"⚠️ Script `{file_name}` đang TREO bị crash liên tục. Hệ thống tạm dừng auto-restart.\n👉 Vui lòng xem Logs và chạy lại thủ công.",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-                return
-
-            ok = self._spawn_script_process(script_path, user_id, folder, file_name, script_type, reason="(TREO)")
-            if ok:
-                try:
-                    bot.send_message(
-                        user_id,
-                        f"♻️ Auto-restart: Script `{file_name}` đã được chạy lại (do đang TREO).",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error(f"Lỗi auto restart {script_key}: {e}")
-
     def _monitor_scripts(self):
         while True:
             time.sleep(10)
             ended: List[Tuple[str, Dict]] = []
 
             with self.lock:
-                for script_key, script_info in list(self.running_scripts.items()):
-                    try:
-                        proc = script_info.get('process')
-                        if not proc:
-                            ended.append((script_key, script_info))
-                            continue
+                items = list(self.running_scripts.items())
 
-                        # proc.poll() != None nghĩa là đã kết thúc
-                        if proc.poll() is not None:
-                            ended.append((script_key, script_info))
-                            continue
+            for script_key, info in items:
+                proc = info.get("process")
+                pid = info.get("pid") or (proc.pid if proc else None)
 
-                        p = psutil.Process(proc.pid)
-                        # Anti-RAM / anti-fork: nếu vượt ngưỡng -> kill + ban
-                        try:
-                            rss_mb = p.memory_info().rss / 1024 / 1024
-                            if rss_mb > MAX_SCRIPT_RSS_MB:
-                                ended.append((script_key, script_info))
-                                try:
-                                    db.ban_user(script_info.get('user_id'), 60, f"Auto ban: vượt RAM {rss_mb:.1f}MB > {MAX_SCRIPT_RSS_MB}MB")
-                                except Exception:
-                                    pass
-                                continue
-
-                            ch = 0
-                            try:
-                                ch = len(p.children(recursive=True))
-                            except Exception:
-                                ch = 0
-                            if ch > MAX_SCRIPT_CHILDREN:
-                                ended.append((script_key, script_info))
-                                try:
-                                    db.ban_user(script_info.get('user_id'), 60, f"Auto ban: spawn quá nhiều process ({ch} > {MAX_SCRIPT_CHILDREN})")
-                                except Exception:
-                                    pass
-                                continue
-                        except Exception:
-                            pass
-
-                        if (not p.is_running()) or p.status() == psutil.STATUS_ZOMBIE:
-                            ended.append((script_key, script_info))
-
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        ended.append((script_key, script_info))
-                    except Exception:
-                        ended.append((script_key, script_info))
-
-                # Cleanup trong lock (đóng log + remove dict)
-                for k, info in ended:
-                    try:
-                        try:
-                            self._kill_process_tree(info)
-                        except Exception:
-                            pass
-                        self._cleanup_script(k)
-                    except Exception:
-                        pass
-
-            # cập nhật DB + auto-restart ngoài lock
-            for k, info in ended:
+                # chết / mất proc
                 try:
-                    db.update_file_status(info.get('user_id'), info.get('file_name'), False)
+                    if not proc or proc.poll() is not None:
+                        ended.append((script_key, info))
+                        continue
                 except Exception:
-                    pass
-                self._maybe_auto_restart(k, info)
-
-    def is_running(self, user_id: int, file_name: str) -> bool:
-        script_key = f"{user_id}_{file_name}"
-        with self.lock:
-            return script_key in self.running_scripts
-    
-    def run_python_script(self, script_path: str, user_id: int, folder: str, 
-                          file_name: str, message) -> bool:
-        script_key = f"{user_id}_{file_name}"
-        
-        try:
-            if not os.path.exists(script_path):
-                return False
-            
-            if self.is_running(user_id, file_name):
-                bot.reply_to(message, "⚠️ Script đang chạy!")
-                return False
-            
-            # Kiểm tra và cài đặt dependencies
-            if not self._check_python_deps(script_path, folder, message):
-                return False
-            
-            # Tạo file log
-            log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
-            log_file = open(log_path, 'a', encoding='utf-8', errors='ignore')
-            log_file.write(f"\n--- BẮT ĐẦU CHẠY {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-            log_file.flush()
-            
-            # Chạy script
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-            process = subprocess.Popen(
-                [sys.executable, script_path],
-                cwd=folder,
-                stdout=log_file,
-                stderr=log_file,
-                stdin=subprocess.PIPE,
-                startupinfo=startupinfo,
-                encoding='utf-8',
-                errors='ignore',
-                preexec_fn=self._make_preexec_limits(),
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            
-            with self.lock:
-                self.running_scripts[script_key] = {
-                    'process': process,
-                    'log_file': log_file,
-                    'file_name': file_name,
-                    'user_id': user_id,
-                    'start_time': datetime.now(),
-                    'folder': folder,
-                    'type': 'py',
-                    'pid': process.pid
-                }
-            
-            db.update_file_status(user_id, file_name, True, process.pid)
-            
-            # Gửi thông báo
-            bot.reply_to(
-                message,
-                f"✅ **Đã chạy script Python**\n\n"
-                f"📄 **File:** `{file_name}`\n"
-                f"🆔 **PID:** `{process.pid}`\n"
-                f"👤 **User:** `{user_id}`\n"
-                f"📝 **Log:** Xem trong menu quản lý",
-                parse_mode='Markdown'
-            )
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Lỗi chạy Python script {script_key}: {e}")
-            bot.reply_to(message, f"❌ Lỗi khi chạy script: {str(e)}")
-            return False
-    
-    def run_js_script(self, script_path: str, user_id: int, folder: str,
-                      file_name: str, message) -> bool:
-        script_key = f"{user_id}_{file_name}"
-        
-        try:
-            if not os.path.exists(script_path):
-                return False
-            
-            if self.is_running(user_id, file_name):
-                bot.reply_to(message, "⚠️ Script đang chạy!")
-                return False
-            
-            # Kiểm tra Node.js
-            if not self._check_node_installed():
-                bot.reply_to(message, "❌ Node.js chưa được cài đặt!")
-                return False
-            
-            # Kiểm tra và cài đặt dependencies
-            if not self._check_node_deps(folder, message):
-                return False
-            
-            # Tạo file log
-            log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
-            log_file = open(log_path, 'a', encoding='utf-8', errors='ignore')
-            log_file.write(f"\n--- BẮT ĐẦU CHẠY {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-            log_file.flush()
-            
-            # Chạy script
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-            process = subprocess.Popen(
-                ['node', script_path],
-                cwd=folder,
-                stdout=log_file,
-                stderr=log_file,
-                stdin=subprocess.PIPE,
-                startupinfo=startupinfo,
-                encoding='utf-8',
-                errors='ignore',
-                preexec_fn=self._make_preexec_limits(),
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            
-            with self.lock:
-                self.running_scripts[script_key] = {
-                    'process': process,
-                    'log_file': log_file,
-                    'file_name': file_name,
-                    'user_id': user_id,
-                    'start_time': datetime.now(),
-                    'folder': folder,
-                    'type': 'js',
-                    'pid': process.pid
-                }
-            
-            db.update_file_status(user_id, file_name, True, process.pid)
-            
-            bot.reply_to(
-                message,
-                f"✅ **Đã chạy script JavaScript**\n\n"
-                f"📄 **File:** `{file_name}`\n"
-                f"🆔 **PID:** `{process.pid}`\n"
-                f"👤 **User:** `{user_id}`\n"
-                f"📝 **Log:** Xem trong menu quản lý",
-                parse_mode='Markdown'
-            )
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Lỗi chạy JS script {script_key}: {e}")
-            bot.reply_to(message, f"❌ Lỗi khi chạy script: {str(e)}")
-            return False
-    
-    def stop_script(self, user_id: int, file_name: str) -> bool:
-        script_key = f"{user_id}_{file_name}"
-        
-        with self.lock:
-            if script_key in self.running_scripts:
-                script_info = self.running_scripts[script_key]
-                
-                # Ghi log kết thúc
-                try:
-                    if 'log_file' in script_info:
-                        script_info['log_file'].write(
-                            f"\n--- DỪNG LÚC {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n"
-                        )
-                        script_info['log_file'].flush()
-                except:
-                    pass
-                
-                # Kill process
-                self._kill_process_tree(script_info)
-                
-                # Dọn dẹp
-                self._cleanup_script(script_key)
-                db.update_file_status(user_id, file_name, False)
-                return True
-        
-        return False
-
-    def _check_python_deps(self, script_path: str, folder: str, message) -> bool:
-        """Kiểm tra import trong script và cài pip an toàn khi thiếu thư viện.
-
-        - Có timeout để tránh treo
-        - Dùng --no-cache-dir để giảm RAM/Disk (hạn chế OOM)
-        - Báo lỗi rõ ràng thay vì làm bot crash
-        """
-        try:
-            with open(script_path, 'r', encoding='utf-8', errors='ignore') as f:
-                file_content = f.read()
-        except Exception as e:
-            bot.reply_to(message, f"❌ Không đọc được file script: {e}")
-            return False
-
-        try:
-            imports = re.findall(r'^import (\w+)|^from (\w+) import', file_content, re.MULTILINE)
-            modules = set()
-            for imp in imports:
-                mod = imp[0] or imp[1]
-                if mod:
-                    modules.add(mod)
-
-            core_modules = {
-                'os', 'sys', 'time', 'datetime', 'json', 're', 'math',
-                'random', 'threading', 'subprocess', 'logging', 'traceback',
-                'collections', 'functools', 'itertools', 'copy', 'enum',
-                'typing', 'dataclasses', 'contextlib', 'queue', 'hashlib'
-            }
-
-            for module in modules:
-                if module in core_modules:
+                    ended.append((script_key, info))
                     continue
 
+                # defensive check: RAM / children
                 try:
-                    __import__(module)
-                except ImportError:
-                    package = self._get_pip_package(module)
-                    if not package:
-                        bot.reply_to(
-                            message,
-                            f"⚠️ Thiếu module `{module}` nhưng không xác định được pip package. "
-                            f"Hãy cài thủ công hoặc thêm vào requirements.txt."
-                        )
-                        return False
+                    if pid:
+                        p = psutil.Process(pid)
+                        rss_mb = p.memory_info().rss / 1024 / 1024
+                        if rss_mb > MAX_SCRIPT_RSS_MB:
+                            # kill + ban 60 phút
+                            try:
+                                db.ban_user(int(info.get("user_id")), 60, f"Auto ban: vượt RAM {rss_mb:.1f}MB > {MAX_SCRIPT_RSS_MB}MB")
+                            except Exception:
+                                pass
+                            ended.append((script_key, info))
+                            continue
 
-                    bot.reply_to(message, f"📦 Thiếu thư viện `{package}`. Đang cài đặt...")
-
-                    try:
-                        result = subprocess.run(
-                            [
-                                sys.executable, '-m', 'pip', 'install',
-                                '--disable-pip-version-check',
-                                '--no-cache-dir',
-                                '--user', package
-                            ],
-                            capture_output=True,
-                            text=True,
-                            timeout=300
-                        )
-                    except subprocess.TimeoutExpired:
-                        bot.reply_to(
-                            message,
-                            f"⏱️ Cài `{package}` quá lâu (timeout). "
-                            f"Hãy thử lại hoặc thêm `{package}` vào requirements.txt."
-                        )
-                        return False
-                    except Exception as e:
-                        bot.reply_to(message, f"❌ Lỗi khi cài `{package}`: {e}")
-                        return False
-
-                    if result.returncode != 0:
-                        err = (result.stderr or result.stdout or '').strip()
-                        if len(err) > 1200:
-                            err = err[-1200:]
-                        bot.reply_to(
-                            message,
-                            f"❌ Không cài được `{package}`.\n"
-                            f"🧾 Log (rút gọn):\n{err or 'No stderr'}"
-                        )
-                        logger.error(f"Pip error ({package}): {result.stderr}")
-                        return False
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Lỗi kiểm tra dependencies: {e}", exc_info=True)
-            bot.reply_to(message, f"❌ Lỗi kiểm tra thư viện: {e}")
-            return False
-
-    def _check_node_deps(self, folder: str, message) -> bool:
-        package_json = os.path.join(folder, 'package.json')
-        
-        if os.path.exists(package_json):
-            bot.reply_to(message, "📦 Đang cài đặt Node.js dependencies...")
-            
-            result = subprocess.run(
-                ['npm', 'install', '--no-fund', '--no-audit'],
-                cwd=folder,
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            
-            if result.returncode != 0:
-                bot.reply_to(message, f"❌ Lỗi cài đặt npm packages")
-                logger.error(f"NPM error: {result.stderr}")
-                return False
-        
-        return True
-    
-    def _check_node_installed(self) -> bool:
-        try:
-            result = subprocess.run(['node', '--version'], capture_output=True, timeout=5)
-            return result.returncode == 0
-        except:
-            return False
-    
-    def _get_pip_package(self, module: str) -> str:
-        package_map = {
-            'telebot': 'pyTelegramBotAPI',
-            'telegram': 'python-telegram-bot',
-            'aiogram': 'aiogram',
-            'pyrogram': 'pyrogram',
-            'telethon': 'telethon',
-            'requests': 'requests',
-            'bs4': 'beautifulsoup4',
-            'pillow': 'Pillow',
-            'PIL': 'Pillow',
-            'cv2': 'opencv-python',
-            'numpy': 'numpy',
-            'pandas': 'pandas',
-            'flask': 'Flask',
-            'django': 'Django',
-            'psutil': 'psutil',
-            'aiohttp': 'aiohttp',
-            'asyncpg': 'asyncpg',
-            'redis': 'redis',
-            'pymongo': 'pymongo',
-            'sqlalchemy': 'sqlalchemy',
-            'discord': 'discord.py',
-            'selenium': 'selenium',
-            'beautifulsoup': 'beautifulsoup4',
-            'matplotlib': 'matplotlib',
-            'scipy': 'scipy',
-            'sklearn': 'scikit-learn',
-            'tensorflow': 'tensorflow',
-            'torch': 'torch',
-            'transformers': 'transformers',
-        }
-        return package_map.get(module, module)
-    
-    def _kill_process_tree(self, script_info: Dict):
-        try:
-            if 'log_file' in script_info:
-                try:
-                    script_info['log_file'].close()
-                except:
-                    pass
-            
-            process = script_info.get('process')
-            if process and process.pid:
-                try:
-                    parent = psutil.Process(process.pid)
-                    children = parent.children(recursive=True)
-                    
-                    for child in children:
                         try:
-                            child.kill()
-                        except:
-                            pass
-                    
-                    parent.kill()
-                    parent.wait(timeout=3)
-                    
-                except psutil.NoSuchProcess:
+                            ch = len(p.children(recursive=True))
+                        except Exception:
+                            ch = 0
+                        if ch > MAX_SCRIPT_CHILDREN:
+                            try:
+                                db.ban_user(int(info.get("user_id")), 60, f"Auto ban: spawn quá nhiều process ({ch} > {MAX_SCRIPT_CHILDREN})")
+                            except Exception:
+                                pass
+                            ended.append((script_key, info))
+                            continue
+
+                        if (not p.is_running()) or p.status() == psutil.STATUS_ZOMBIE:
+                            ended.append((script_key, info))
+                            continue
+                except Exception:
+                    # nếu psutil lỗi -> ignore
                     pass
-                except psutil.TimeoutExpired:
-                    try:
-                        parent.kill()
-                    except:
-                        pass
-                    
-        except Exception as e:
-            logger.error(f"Lỗi kill process: {e}")
-    
-    def _cleanup_script(self, script_key: str):
-        if script_key in self.running_scripts:
-            script_info = self.running_scripts[script_key]
+
+            # cleanup + optional restart (chỉ khi file đang treo/pin)
+            for script_key, info in ended:
+                try:
+                    self._kill_process_tree(info)
+                except Exception:
+                    pass
+
+                # auto restart nếu đang treo
+                try:
+                    uid = int(info.get("user_id"))
+                    fname = info.get("file_name")
+                    pin_until = db.get_file_pinned_until(uid, fname)
+                    if self._is_pin_active(pin_until) and self._restart_allowed(script_key):
+                        # restart
+                        ok, _ = (self.run_python_script(uid, fname) if info.get("type") == "py" else self.run_js_script(uid, fname))
+                        if ok:
+                            try:
+                                bot.send_message(uid, f"♻️ Auto-restart: `{fname}` đã được chạy lại.", parse_mode="Markdown")
+                            except Exception:
+                                pass
+                            continue
+                except Exception:
+                    pass
+
+                self._cleanup_script(script_key)
+
+    def _coin_enforcer_loop(self):
+        while True:
             try:
-                if 'log_file' in script_info:
-                    script_info['log_file'].close()
-            except:
+                if not AUTO_STOP_WHEN_COINS_EMPTY:
+                    time.sleep(30)
+                    continue
+
+                with self.lock:
+                    items = list(self.running_scripts.items())
+
+                for script_key, info in items:
+                    try:
+                        uid = int(info.get("user_id"))
+                        fname = info.get("file_name")
+                        if not uid or not fname:
+                            continue
+                        if db.is_admin(uid):
+                            continue
+
+                        u = db.get_user(uid)
+                        if not u:
+                            continue
+                        if u.balance > 0:
+                            continue
+
+                        pin_until = db.get_file_pinned_until(uid, fname)
+                        if self._is_pin_active(pin_until):
+                            continue
+
+                        self.stop_script(uid, fname)
+                        try:
+                            bot.send_message(uid, f"⛔ Hết coin nên hệ thống đã dừng `{fname}`.", parse_mode="Markdown")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            except Exception:
                 pass
-            del self.running_scripts[script_key]
-    
-    def get_logs(self, user_id: int, file_name: str, lines: int = 100) -> Optional[str]:
+
+            time.sleep(20)
+
+    # --------- logs / stats ---------
+    def get_logs(self, user_id: int, file_name: str, lines: int = 100) -> str:
         folder = get_user_folder(user_id)
         log_path = os.path.join(folder, f"{os.path.splitext(file_name)[0]}.log")
-        
-        if os.path.exists(log_path):
-            try:
-                with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.readlines()
-                    
-                    # Lấy N dòng cuối
-                    if len(content) > lines:
-                        content = content[-lines:]
-                    
-                    result = ''.join(content)
-                    
-                    # Giới hạn độ dài
-                    if len(result) > 3500:
-                        result = "...\n" + result[-3500:]
-                    
-                    return result
-            except Exception as e:
-                return f"❌ Không thể đọc file log: {e}"
-        
-        return "📭 Chưa có logs"
-    
+
+        if not os.path.exists(log_path):
+            return "📭 Chưa có logs"
+
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.readlines()
+            if len(content) > lines:
+                content = content[-lines:]
+            result = "".join(content)
+            if len(result) > 3500:
+                result = "...\n" + result[-3500:]
+            return result
+        except Exception as e:
+            return f"❌ Không thể đọc file log: {e}"
+
     def get_all_running(self) -> List[Dict]:
-        running = []
         with self.lock:
-            for script_key, script_info in list(self.running_scripts.items()):
-                running.append({
-                    'user_id': script_info['user_id'],
-                    'file_name': script_info['file_name'],
-                    'type': script_info['type'],
-                    'start_time': script_info['start_time'],
-                    'pid': script_info.get('pid')
-                })
+            items = list(self.running_scripts.values())
+        running = []
+        for info in items:
+            running.append({
+                "user_id": info.get("user_id"),
+                "file_name": info.get("file_name"),
+                "type": info.get("type"),
+                "start_time": info.get("start_time"),
+                "pid": info.get("pid"),
+            })
         return running
-    
+
     def get_stats(self) -> Dict:
         with self.lock:
-            return {
-                'total_running': len(self.running_scripts),
-                'python': sum(1 for s in self.running_scripts.values() if s['type'] == 'py'),
-                'javascript': sum(1 for s in self.running_scripts.values() if s['type'] == 'js'),
-                'scripts': [
-                    {
-                        'user_id': s['user_id'],
-                        'file': s['file_name'],
-                        'type': s['type'],
-                        'uptime': (datetime.now() - s['start_time']).seconds // 60
-                    }
-                    for s in self.running_scripts.values()
-                ]
-            }
+            scripts = list(self.running_scripts.values())
+
+        return {
+            "total_running": len(scripts),
+            "python": sum(1 for s in scripts if s.get("type") == "py"),
+            "javascript": sum(1 for s in scripts if s.get("type") == "js"),
+            "scripts": [
+                {
+                    "user_id": s.get("user_id"),
+                    "file": s.get("file_name"),
+                    "type": s.get("type"),
+                    "uptime": (datetime.now() - s.get("start_time")).seconds // 60 if s.get("start_time") else 0,
+                }
+                for s in scripts
+            ],
+        }
+
 
 # ==================== KHỞI TẠO SCRIPT MANAGER ====================
 script_manager = BotScriptManager()
@@ -2118,7 +1832,7 @@ class SpamProtector:
         self._violations = defaultdict(int)  # user_id -> count
         self._lock = threading.RLock()
 
-    def check(self, user_id: int, key: str, limit: int, window_seconds: int, ban_minutes: int = SPAM_PENALTY_MINUTES) -> Tuple[bool, str]:
+    def check(self, user_id: int, key: str, limit: int, window_seconds: int, ban_minutes: int = SPAM_PENALTY_MINUTES, ban_on_first_violation: bool = False, violation_threshold: int = 3) -> Tuple[bool, str]:
         now = time.time()
         k = (user_id, key)
 
@@ -2133,7 +1847,7 @@ class SpamProtector:
                 vio = self._violations[user_id]
 
                 # Phạt tăng dần
-                if vio >= 3:
+                if ban_on_first_violation or vio >= violation_threshold:
                     try:
                         db.ban_user(user_id, ban_minutes, f"Auto-ban spam ({key})")
                     except Exception:
@@ -2284,6 +1998,37 @@ class FileSecurityScanner:
 
 
 spam_protector = SpamProtector()
+
+def check_message_spam(message) -> bool:
+    """Anti spam tin nhắn: 15 tin / 60s -> ban 30 phút."""
+    try:
+        user_id = message.from_user.id
+    except Exception:
+        return True
+
+    # Admin/owner bỏ qua
+    try:
+        if db.is_admin(user_id):
+            return True
+    except Exception:
+        pass
+
+    ok, msg = spam_protector.check(
+        user_id,
+        key="msg",
+        limit=SPAM_CHAT_MSG_LIMIT,
+        window_seconds=SPAM_CHAT_MSG_WINDOW,
+        ban_minutes=SPAM_CHAT_MSG_BAN_MINUTES,
+        ban_on_first_violation=True,
+    )
+    if not ok:
+        try:
+            bot.reply_to(message, msg)
+        except Exception:
+            pass
+        return False
+    return True
+
 file_scanner = FileSecurityScanner()
 
 # ==================== HÀM TIỆN ÍCH ====================
@@ -2675,6 +2420,10 @@ def cmd_start(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     # Kiểm tra và cập nhật user
     user = check_and_update_user(user_id, username, first_name, ip)
@@ -2869,6 +2618,10 @@ def cmd_menu(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     user = check_and_update_user(
         user_id,
@@ -2891,6 +2644,10 @@ def cmd_daily(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     user = check_and_update_user(
         user_id,
@@ -2921,6 +2678,10 @@ def cmd_balance(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     user = check_and_update_user(
         user_id,
@@ -2958,6 +2719,10 @@ def cmd_referral(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     user = check_and_update_user(
         user_id,
@@ -2975,6 +2740,10 @@ def cmd_help(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     help_text = (
         "🆘 **TRỢ GIÚP**\n\n"
@@ -3025,6 +2794,10 @@ def handle_menu_buttons(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     user = check_and_update_user(
         user_id,
@@ -3338,6 +3111,7 @@ def handle_callbacks(call):
         if banned:
             bot.answer_callback_query(call.id, ban_msg, show_alert=True)
             return
+
         
         # Cập nhật user
         user = check_and_update_user(
@@ -5269,6 +5043,10 @@ def handle_document(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
+    # Anti-spam tin nhắn
+    if not check_message_spam(message):
+        return
+
     
     # Cập nhật user
     user = check_and_update_user(
