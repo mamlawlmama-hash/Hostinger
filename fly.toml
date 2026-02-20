@@ -7,7 +7,7 @@ auto_stop_machines = true
 force_https = true
 internal_port = 8_080
 min_machines_running = 0
-processes = [ "d" ]
+processes = [ "main" ]
 
 [[vm]]
 cpu_kind = "shared"
