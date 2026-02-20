@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose port (thay đổi port nếu ứng dụng của bạn dùng port khác)
-EXPOSE 80
+EXPOSE 8080
 
-# Chạy ứng dụng
+# Chạy ứng dụng với host 0.0.0.0 để có thể truy cập từ bên ngoài container
 CMD ["python", "app.py"]
