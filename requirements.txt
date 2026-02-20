@@ -1,10 +1,11 @@
+flask
+threading
+aiohttp
 telethon
 python-dotenv
 typing-extensions
 pyTelegramBotAPI
 python-telegram-bot
-Pillow
 psutil
 requests
-python-dateutil
-pytz
+
