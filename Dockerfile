@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose port (thay đổi port nếu ứng dụng của bạn dùng port khác)
-EXPOSE 5000
+EXPOSE 80
 
 # Chạy ứng dụng
 CMD ["python", "app.py"]
