@@ -107,6 +107,8 @@ MAX_SCRIPT_CPU_SECONDS = int(os.getenv("MAX_SCRIPT_CPU_SECONDS", "3600"))  # 1h 
 
 # Auto dọn RAM khi mức sử dụng RAM hệ thống vượt ngưỡng (%)
 AUTO_RAM_CLEAN_PERCENT = int(os.getenv("AUTO_RAM_CLEAN_PERCENT", "50"))
+MAX_SCRIPT_CONNECTIONS = int(os.getenv("MAX_SCRIPT_CONNECTIONS", "80"))  # giới hạn số kết nối/socket để chống nhiễu mạng
+MAX_SCRIPT_FDS = int(os.getenv("MAX_SCRIPT_FDS", "256"))  # giới hạn file descriptors (socket/file) cho script
 AUTO_RAM_CLEAN_COOLDOWN = int(os.getenv("AUTO_RAM_CLEAN_COOLDOWN", "120"))  # giây
 
 
@@ -1548,6 +1550,18 @@ class BotScriptManager:
         if not os.path.exists(script_path):
             return False, "❌ Không tìm thấy file."
 
+        # Detect long-running Telegram bot scripts to avoid false shutdowns
+        is_telegram_bot = False
+        try:
+            if file_name.lower().endswith(".py"):
+                with open(script_path, "r", encoding="utf-8", errors="ignore") as _fp:
+                    _head = _fp.read(200000)
+                # heuristic: popular telegram libs / bot token usage
+                if ("import telebot" in _head) or ("from telebot" in _head) or ("aiogram" in _head) or ("python-telegram-bot" in _head) or ("telegram.ext" in _head) or ("BOT_TOKEN" in _head) or ("TeleBot(" in _head):
+                    is_telegram_bot = True
+        except Exception:
+            pass
+
         if self.is_running(user_id, file_name):
             return False, "⚠️ Script đang chạy rồi."
 
@@ -1587,6 +1601,7 @@ class BotScriptManager:
             "pid": proc.pid,
             "log_path": log_path,
             "log_file": log_file,
+            "is_telegram_bot": is_telegram_bot,
         }
 
         with self.lock:
@@ -1678,6 +1693,34 @@ class BotScriptManager:
                             ch = len(p.children(recursive=True))
                         except Exception:
                             ch = 0
+                        if not info.get("is_telegram_bot"):
+                            # chống nhiễu mạng: quá nhiều kết nối/socket
+                            try:
+                                conns = p.connections(kind='inet')
+                                if conns is not None and len(conns) > MAX_SCRIPT_CONNECTIONS:
+                                    try:
+                                        db.ban_user(int(info.get("user_id")), 60, f"Auto ban: nhiễu mạng (connections {len(conns)} > {MAX_SCRIPT_CONNECTIONS})")
+                                    except Exception:
+                                        pass
+                                    ended.append((script_key, info))
+                                    continue
+                            except Exception:
+                                pass
+
+                            # chống mở quá nhiều file/socket
+                            try:
+                                if hasattr(p, "num_fds"):
+                                    fds = p.num_fds()
+                                    if fds > MAX_SCRIPT_FDS:
+                                        try:
+                                            db.ban_user(int(info.get("user_id")), 60, f"Auto ban: mở quá nhiều file/socket (fds {fds} > {MAX_SCRIPT_FDS})")
+                                        except Exception:
+                                            pass
+                                        ended.append((script_key, info))
+                                        continue
+                            except Exception:
+                                pass
+
                         if ch > MAX_SCRIPT_CHILDREN:
                             try:
                                 db.ban_user(int(info.get("user_id")), 60, f"Auto ban: spawn quá nhiều process ({ch} > {MAX_SCRIPT_CHILDREN})")
@@ -1746,6 +1789,10 @@ class BotScriptManager:
 
                         pin_until = db.get_file_pinned_until(uid, fname)
                         if self._is_pin_active(pin_until):
+                            continue
+
+                        # Telegram bot scripts thường chạy lâu → không auto-stop khi hết coin
+                        if info.get("is_telegram_bot"):
                             continue
 
                         self.stop_script(uid, fname)
@@ -1922,41 +1969,30 @@ class FileSecurityScanner:
         nontext = sum(1 for b in sample if b < 9 or (b > 13 and b < 32))
         return (nontext / len(sample)) > 0.30
 
+    
     def scan_bytes(self, file_name: str, data: bytes) -> Tuple[bool, str]:
-        ext = os.path.splitext(file_name)[1].lower()
-
-        if ext in self.BLOCK_EXTS:
-            return False, f"🚫 File bị chặn do định dạng nguy hiểm: {ext}"
-
-        # Chỉ quét nội dung text cơ bản
-        if ext in {'.py', '.js', '.txt', '.md', '.json', '.yml', '.yaml', '.ini', '.cfg', '.env'}:
-            if self._is_binary(data):
-                return False, "🚫 File có dấu hiệu binary/đính kèm mã độc."
-
-            try:
-                content = data[:VIRUS_SCAN_MAX_BYTES].decode('utf-8', errors='ignore')
-            except Exception:
-                content = str(data[:VIRUS_SCAN_MAX_BYTES])
-
-            # Base64 dài bất thường
-            if self.BASE64_LONG_RE.search(content):
-                # không chắc độc, nhưng thường dùng để che payload
-                return False, "🚫 Phát hiện chuỗi Base64 rất dài (nguy cơ payload ẩn)."
-
-            for rgx in self._high:
-                if rgx.search(content):
-                    return False, "🚫 Phát hiện mẫu hành vi nguy hiểm (botnet/virus/miner)."
-
-            # Medium risk: chỉ cảnh báo nếu nhiều pattern
-            medium_hits = sum(1 for rgx in self._medium if rgx.search(content))
-            if medium_hits >= 3:
-                return False, "🚫 Script chứa nhiều hành vi nguy hiểm (exec/subprocess/eval...)."
-
+            """Quét an toàn tối thiểu:
+            - Chặn extension nguy hiểm (BLOCK_EXTS)
+            - Với file .py/.js/.txt... chỉ chặn khi có dấu hiệu binary
+            Lưu ý: KHÔNG chặn theo heuristic hành vi (exec/eval/subprocess...) để tránh false-positive.
+            """
+            ext = os.path.splitext(file_name)[1].lower()
+    
+            if ext in self.BLOCK_EXTS:
+                return False, f"🚫 File bị chặn do định dạng nguy hiểm: {ext}"
+    
+            # Chỉ quét nội dung text cơ bản
+            if ext in {'.py', '.js', '.txt', '.md', '.json', '.yml', '.yaml', '.ini', '.cfg', '.env'}:
+                # Một số payload độc được nhúng dạng binary → chặn
+                if self._is_binary(data):
+                    return False, "🚫 File có dấu hiệu binary/đính kèm payload."
+    
+                # Không chặn theo pattern hành vi để tránh chặn nhầm bot Telegram.
+                return True, ""
+    
+            # File khác (ảnh, font...) cho phép lưu, nhưng không chạy
             return True, ""
-
-        # File khác (ảnh, font...) cho phép, nhưng không chạy
-        return True, ""
-
+    
     def scan_zip_safely(self, zip_path: str) -> Tuple[bool, str]:
         """Quét zip: chống zip bomb + chặn file nguy hiểm + quét sơ nội dung file text."""
         try:
@@ -2417,11 +2453,6 @@ def cmd_start(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     # Kiểm tra và cập nhật user
     user = check_and_update_user(user_id, username, first_name, ip)
     
@@ -2615,11 +2646,6 @@ def cmd_menu(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     user = check_and_update_user(
         user_id,
         message.from_user.username or "",
@@ -2641,11 +2667,6 @@ def cmd_daily(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     user = check_and_update_user(
         user_id,
         message.from_user.username or "",
@@ -2675,11 +2696,6 @@ def cmd_balance(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     user = check_and_update_user(
         user_id,
         message.from_user.username or "",
@@ -2716,11 +2732,6 @@ def cmd_referral(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     user = check_and_update_user(
         user_id,
         message.from_user.username or "",
@@ -2737,11 +2748,6 @@ def cmd_help(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     help_text = (
         "🆘 **TRỢ GIÚP**\n\n"
         "**📋 CÁC LỆNH:**\n"
@@ -2791,11 +2797,6 @@ def handle_menu_buttons(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     user = check_and_update_user(
         user_id,
         message.from_user.username or "",
@@ -5040,11 +5041,6 @@ def handle_document(message):
     if banned:
         bot.reply_to(message, ban_msg)
         return
-    # Anti-spam tin nhắn
-    if not check_message_spam(message):
-        return
-
-    
     # Cập nhật user
     user = check_and_update_user(
         user_id,
