@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 80
 
 # Chạy ứng dụng
-CMD ["python", "main.py"]
+CMD ["python", "app.py"]
