@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 import subprocess
 import os
 import zipfile
@@ -23,6 +24,10 @@ import hashlib
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import signal
+try:
+    import resource  # unix only (rlimit)
+except Exception:
+    resource = None
 from typing import Optional, Dict, List, Tuple, Set, Any, Union
 from dataclasses import dataclass, field
 from contextlib import contextmanager
@@ -33,10 +38,15 @@ import json
 import traceback
 
 # ==================== CẤU HÌNH ====================
-TOKEN = '8505111864:AAGWXTB64emvtRoAwDm_zYrKZH88aDkLJks'
-OWNER_ID = 8208489603
-YOUR_USERNAME = '@taolailove2'
+# ⚠️ Khuyến nghị: đặt token qua biến môi trường để tránh lộ token khi share code
+# Linux/Mac:  export BOT_TOKEN="123:ABC..."
+# Windows:    setx BOT_TOKEN "123:ABC..."
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOKEN") or ""
+OWNER_ID = int(os.getenv("OWNER_ID", "8208489603"))
+YOUR_USERNAME = os.getenv("YOUR_USERNAME", "@taolailove2")
 
+if not TOKEN:
+    raise RuntimeError("❌ Thiếu BOT_TOKEN/TELEGRAM_BOT_TOKEN. Hãy set biến môi trường chứa token bot Telegram.")
 # Cấu hình thư mục
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
@@ -83,6 +93,23 @@ MAX_ZIP_EXTRACT_MB = 100  # giới hạn tổng dung lượng giải nén để 
 MAX_ZIP_FILE_COUNT = 300  # giới hạn số file trong zip
 VIRUS_SCAN_MAX_BYTES = 2 * 1024 * 1024  # đọc tối đa 2MB mỗi file khi quét
 
+# ==================== BẢO VỆ TÀI NGUYÊN / COIN GATE ====================
+# Gate cơ bản: cần có tối thiểu coin để dùng các chức năng tốn tài nguyên
+MIN_COINS_TO_UPLOAD = int(os.getenv("MIN_COINS_TO_UPLOAD", "1"))
+MIN_COINS_TO_DOWNLOAD = int(os.getenv("MIN_COINS_TO_DOWNLOAD", "1"))
+# Nếu hết coin -> dừng các script KHÔNG treo (đã treo vẫn chạy vì đã trả coin)
+AUTO_STOP_WHEN_COINS_EMPTY = os.getenv("AUTO_STOP_WHEN_COINS_EMPTY", "1") == "1"
+
+# Giới hạn tài nguyên mỗi script (defensive anti-RAM bomb)
+MAX_SCRIPT_RSS_MB = int(os.getenv("MAX_SCRIPT_RSS_MB", "300"))  # kill nếu vượt (MB)
+MAX_SCRIPT_CHILDREN = int(os.getenv("MAX_SCRIPT_CHILDREN", "30"))  # kill nếu spawn quá nhiều
+MAX_SCRIPT_CPU_SECONDS = int(os.getenv("MAX_SCRIPT_CPU_SECONDS", "3600"))  # 1h CPU time (Linux)
+
+# Auto dọn RAM khi mức sử dụng RAM hệ thống vượt ngưỡng (%)
+AUTO_RAM_CLEAN_PERCENT = int(os.getenv("AUTO_RAM_CLEAN_PERCENT", "50"))
+AUTO_RAM_CLEAN_COOLDOWN = int(os.getenv("AUTO_RAM_CLEAN_COOLDOWN", "120"))  # giây
+
+
 
 # Cấu hình Anti-Buff
 MAX_REFS_PER_IP = 3
@@ -105,15 +132,80 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== KHỞI TẠO BOT ====================
-bot = telebot.TeleBot(TOKEN)
-bot.set_my_commands([
-    telebot.types.BotCommand("start", "🚀 Khởi động bot"),
-    telebot.types.BotCommand("menu", "📋 Menu chính"),
-    telebot.types.BotCommand("daily", "🎁 Nhận coin hàng ngày"),
-    telebot.types.BotCommand("balance", "💰 Xem số dư"),
-    telebot.types.BotCommand("referral", "👥 Giới thiệu bạn bè"),
-    telebot.types.BotCommand("help", "🆘 Trợ giúp")
-])
+# ==================== KHỞI TẠO BOT ====================
+# Tăng số luồng để xử lý mượt hơn (phù hợp đa số host)
+try:
+    bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=int(os.getenv("BOT_THREADS", "8")))
+except TypeError:
+    # Fallback cho bản pyTelegramBotAPI cũ
+    bot = telebot.TeleBot(TOKEN)
+
+# ==================== SAFE TELEGRAM CALLS ====================
+# Tránh crash với các lỗi "không nghiêm trọng" (đặc biệt: message is not modified)
+def _should_ignore_telegram_exception(e: Exception) -> bool:
+    if not isinstance(e, ApiTelegramException):
+        return False
+
+    msg = str(e).lower()
+
+    # Telegram trả 400 khi edit y hệt nội dung/markup cũ
+    if "message is not modified" in msg:
+        return True
+
+    # Race condition / tin nhắn không còn hợp lệ để edit/delete
+    if "message to edit not found" in msg:
+        return True
+    if "message can't be edited" in msg:
+        return True
+    if "message to delete not found" in msg:
+        return True
+
+    # Callback quá hạn (người dùng bấm nút rất lâu sau)
+    if "query is too old" in msg or "response timeout expired" in msg:
+        return True
+
+    return False
+
+def _wrap_bot_method_safe(method_name: str):
+    original = getattr(bot, method_name, None)
+    if not original:
+        return
+
+    def wrapper(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except ApiTelegramException as e:
+            if _should_ignore_telegram_exception(e):
+                return None
+            raise
+
+    setattr(bot, method_name, wrapper)
+
+for _name in ("edit_message_text", "edit_message_reply_markup", "delete_message", "answer_callback_query"):
+    _wrap_bot_method_safe(_name)
+
+# Cache bot username để tránh gọi get_me() quá nhiều (giảm lag/rate-limit)
+_BOT_USERNAME_CACHE = None
+
+def get_bot_username() -> str:
+    global _BOT_USERNAME_CACHE
+    if not _BOT_USERNAME_CACHE:
+        try:
+            _BOT_USERNAME_CACHE = bot.get_me().username
+        except Exception:
+            _BOT_USERNAME_CACHE = ""
+    return _BOT_USERNAME_CACHE or ""
+try:
+    bot.set_my_commands([
+        telebot.types.BotCommand("start", "🚀 Khởi động bot"),
+        telebot.types.BotCommand("menu", "📋 Menu chính"),
+        telebot.types.BotCommand("daily", "🎁 Nhận coin hàng ngày"),
+        telebot.types.BotCommand("balance", "💰 Xem số dư"),
+        telebot.types.BotCommand("referral", "👥 Giới thiệu bạn bè"),
+        telebot.types.BotCommand("help", "🆘 Trợ giúp")
+    ])
+except Exception as e:
+    logger.warning(f"⚠️ Không thể set_my_commands: {e}")
 
 # ==================== CẤU TRÚC DỮ LIỆU ====================
 @dataclass
@@ -888,7 +980,7 @@ class DatabaseManager:
             # Xóa file ảnh
             if image_path and os.path.exists(image_path):
                 try:
-                    os.remove(captcha['image_path'])
+                    os.remove(image_path)
                 except:
                     pass
     
@@ -1319,6 +1411,79 @@ class BotScriptManager:
         self.restart_history: Dict[str, deque] = defaultdict(deque)
         self.monitor_thread = threading.Thread(target=self._monitor_scripts, daemon=True)
         self.monitor_thread.start()
+        self.coin_thread = threading.Thread(target=self._coin_enforcer_loop, daemon=True)
+        self.coin_thread.start()
+
+def _make_preexec_limits(self):
+    """Chỉ áp dụng trên Linux/Unix: giới hạn tài nguyên để tránh 'cắn RAM' / fork bomb."""
+    if os.name == 'nt' or resource is None:
+        return None
+
+    def _preexec():
+        try:
+            os.setsid()
+        except Exception:
+            pass
+        try:
+            if hasattr(resource, 'RLIMIT_NPROC'):
+                resource.setrlimit(resource.RLIMIT_NPROC, (MAX_SCRIPT_CHILDREN, MAX_SCRIPT_CHILDREN))
+        except Exception:
+            pass
+        try:
+            if hasattr(resource, 'RLIMIT_FSIZE'):
+                resource.setrlimit(resource.RLIMIT_FSIZE, (50 * 1024 * 1024, 50 * 1024 * 1024))
+        except Exception:
+            pass
+        try:
+            if hasattr(resource, 'RLIMIT_CPU'):
+                resource.setrlimit(resource.RLIMIT_CPU, (MAX_SCRIPT_CPU_SECONDS, MAX_SCRIPT_CPU_SECONDS))
+        except Exception:
+            pass
+        try:
+            if hasattr(resource, 'RLIMIT_AS'):
+                lim = int(MAX_SCRIPT_RSS_MB) * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+        except Exception:
+            pass
+
+    return _preexec
+
+def _coin_enforcer_loop(self):
+    while True:
+        try:
+            if not AUTO_STOP_WHEN_COINS_EMPTY:
+                time.sleep(30)
+                continue
+
+            with self.lock:
+                items = list(self.running_scripts.items())
+
+            for script_key, info in items:
+                try:
+                    uid = int(info.get('user_id'))
+                    fname = info.get('file_name')
+                    if not uid or not fname:
+                        continue
+                    if db.is_admin(uid):
+                        continue
+                    u = db.get_user(uid)
+                    if not u:
+                        continue
+                    if u.balance > 0:
+                        continue
+                    pin_until = db.get_file_pinned_until(uid, fname)
+                    if is_pin_active(pin_until):
+                        continue
+                    self.stop_script(uid, fname)
+                    try:
+                        bot.send_message(uid, f"⛔ Hết coin nên hệ thống đã dừng `{fname}`.", parse_mode='Markdown')
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(20)
 
     def _restart_allowed(self, script_key: str, max_restarts: int = 5, window_seconds: int = 600) -> bool:
         """Giới hạn auto-restart để tránh loop crash."""
@@ -1365,6 +1530,7 @@ class BotScriptManager:
                 startupinfo=startupinfo,
                 encoding='utf-8',
                 errors='ignore',
+                preexec_fn=self._make_preexec_limits(),
                 creationflags=creationflags
             )
 
@@ -1455,8 +1621,35 @@ class BotScriptManager:
                             continue
 
                         p = psutil.Process(proc.pid)
+                        # Anti-RAM / anti-fork: nếu vượt ngưỡng -> kill + ban
+                        try:
+                            rss_mb = p.memory_info().rss / 1024 / 1024
+                            if rss_mb > MAX_SCRIPT_RSS_MB:
+                                ended.append((script_key, script_info))
+                                try:
+                                    db.ban_user(script_info.get('user_id'), 60, f"Auto ban: vượt RAM {rss_mb:.1f}MB > {MAX_SCRIPT_RSS_MB}MB")
+                                except Exception:
+                                    pass
+                                continue
+
+                            ch = 0
+                            try:
+                                ch = len(p.children(recursive=True))
+                            except Exception:
+                                ch = 0
+                            if ch > MAX_SCRIPT_CHILDREN:
+                                ended.append((script_key, script_info))
+                                try:
+                                    db.ban_user(script_info.get('user_id'), 60, f"Auto ban: spawn quá nhiều process ({ch} > {MAX_SCRIPT_CHILDREN})")
+                                except Exception:
+                                    pass
+                                continue
+                        except Exception:
+                            pass
+
                         if (not p.is_running()) or p.status() == psutil.STATUS_ZOMBIE:
                             ended.append((script_key, script_info))
+
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         ended.append((script_key, script_info))
                     except Exception:
@@ -1523,6 +1716,7 @@ class BotScriptManager:
                 startupinfo=startupinfo,
                 encoding='utf-8',
                 errors='ignore',
+                preexec_fn=self._make_preexec_limits(),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             
@@ -1600,6 +1794,7 @@ class BotScriptManager:
                 startupinfo=startupinfo,
                 encoding='utf-8',
                 errors='ignore',
+                preexec_fn=self._make_preexec_limits(),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             
@@ -2445,7 +2640,7 @@ def create_admin_panel_menu() -> types.InlineKeyboardMarkup:
 def create_referral_menu(user_id: int) -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=1)
     
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
     
     markup.row(
@@ -2489,6 +2684,15 @@ def cmd_start(message):
     
     # Kiểm tra suspicious
     check_suspicious(user)
+
+    # Gate coin upload (chống abuse tài nguyên)
+    if (not db.is_admin(user_id)) and user.balance < MIN_COINS_TO_UPLOAD:
+        bot.reply_to(
+            message,
+            f"⛔ Cần tối thiểu `{MIN_COINS_TO_UPLOAD}` coin để upload.\n💰 Số dư hiện tại: `{format_number(user.balance)}`",
+            parse_mode='Markdown'
+        )
+        return
     
     # Xử lý referral
     if message.text and len(message.text.split()) > 1:
@@ -2868,7 +3072,7 @@ def show_balance(message, user: UserData):
     )
 
 def show_referral_info(message, user: UserData):
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     ref_link = f"https://t.me/{bot_username}?start=ref_{user.user_id}"
     
     markup = create_referral_menu(user.user_id)
@@ -3210,7 +3414,7 @@ def handle_callbacks(call):
         # REFERRAL
         elif data == "referral":
             bot.answer_callback_query(call.id)
-            bot_username = bot.get_me().username
+            bot_username = get_bot_username()
             ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
             
             stats = db.get_referral_stats(user_id)
@@ -3231,7 +3435,7 @@ def handle_callbacks(call):
         # COPY REF LINK
         elif data.startswith("copy_ref_"):
             referrer_id = int(data.replace("copy_ref_", ""))
-            bot_username = bot.get_me().username
+            bot_username = get_bot_username()
             ref_link = f"https://t.me/{bot_username}?start=ref_{referrer_id}"
             
             bot.answer_callback_query(call.id, "✅ Đã copy link!", show_alert=True)
@@ -3802,6 +4006,14 @@ def handle_callbacks(call):
                 bot.answer_callback_query(call.id, "⛔ Bạn không có quyền!", show_alert=True)
                 return
             
+
+            # Gate coin run: nếu hết coin thì không cho chạy (trừ khi đang TREO hoặc admin)
+            if not db.is_admin(user_id):
+                u = db.get_user(script_user_id) or db.create_user(script_user_id)
+                _pin_until = db.get_file_pinned_until(script_user_id, file_name)
+                if (u.balance <= 0) and (not is_pin_active(_pin_until)):
+                    bot.answer_callback_query(call.id, "⛔ Hết coin nên không thể chạy script (chỉ script đang TREO mới được chạy).", show_alert=True)
+                    return
             bot.answer_callback_query(call.id, "🔄 Đang khởi chạy...")
             
             folder = get_user_folder(script_user_id)
@@ -3821,6 +4033,23 @@ def handle_callbacks(call):
                 return
             
             file_type = 'py' if file_name.endswith('.py') else 'js'
+
+            # Quét heuristic trước khi chạy
+            try:
+                with open(file_path, 'rb') as _f:
+                    _b = _f.read(VIRUS_SCAN_MAX_BYTES)
+                ok_mg, mg_msg = malware_guard.scan_bytes(file_name, _b)
+                if not ok_mg:
+                    bot.edit_message_text(
+                        f"❌ **BỊ CHẶN (MALWARE GUARD)**\n\n{mg_msg}",
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        parse_mode='Markdown',
+                        reply_markup=ikb_row(types.InlineKeyboardButton("🔙 Quay Lại", callback_data=f"file_{script_user_id}_{file_name}"))
+                    )
+                    return
+            except Exception:
+                pass
             
             if file_type == 'py':
                 success = script_manager.run_python_script(
@@ -3988,6 +4217,13 @@ def handle_callbacks(call):
                 bot.answer_callback_query(call.id, "⛔ Bạn không có quyền!", show_alert=True)
                 return
             
+
+            # Gate coin download (chống abuse bandwidth)
+            if (not db.is_admin(user_id)):
+                u = db.get_user(user_id) or db.create_user(user_id)
+                if u.balance < MIN_COINS_TO_DOWNLOAD:
+                    bot.answer_callback_query(call.id, f"⛔ Cần tối thiểu {MIN_COINS_TO_DOWNLOAD} coin để download!", show_alert=True)
+                    return
             folder = get_user_folder(script_user_id)
             file_path = os.path.join(folder, file_name)
             
@@ -4338,34 +4574,23 @@ def handle_callbacks(call):
             running = script_manager.get_all_running()
             
             if not running:
-                bot.edit_message_text(
-                    "📭 **KHÔNG CÓ SCRIPT NÀO ĐANG CHẠY**",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode='Markdown',
-                    reply_markup=ikb_row(
-                        types.InlineKeyboardButton("🔙 Quay Lại", callback_data="admin_panel")
-                    )
-                )
-                return
-            
-            text = "🤖 **SCRIPTS ĐANG CHẠY:**\n\n"
-            for s in running:
-                uptime = (datetime.now() - s['start_time']).seconds
-                hours = uptime // 3600
-                minutes = (uptime % 3600) // 60
-                text += f"• **{s['file_name']}** ({s['type']})\n"
-                text += f"  👤 User: `{s['user_id']}` | 🆔 PID: {s['pid']}\n"
-                text += f"  ⏱️ Uptime: {hours}h{minutes}m\n\n"
-            
+                markup = types.InlineKeyboardMarkup(row_width=2)
+            for s in running[:10]:
+                try:
+                    markup.add(types.InlineKeyboardButton(
+                        f"⏹ Stop {s['user_id']}|{s['file_name']}",
+                        callback_data=f"admin_stop_{s['user_id']}_{s['file_name']}"
+                    ))
+                except Exception:
+                    pass
+            markup.row(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="admin_panel"))
+
             bot.edit_message_text(
                 text,
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode='Markdown',
-                reply_markup=ikb_row(
-                    types.InlineKeyboardButton("🔙 Quay Lại", callback_data="admin_panel")
-                )
+                reply_markup=markup
             )
         
         # BROADCAST
@@ -4959,6 +5184,84 @@ def cmd_userinfo(message):
     except (ValueError, IndexError):
         bot.reply_to(message, "❌ Format: /userinfo [user_id]")
 
+
+
+# ==================== MALWARE GUARD (HEURISTIC) ====================
+class MalwareGuard:
+    """Quét heuristic để chặn một số payload nguy hiểm phổ biến.
+    Lưu ý: Không thể đảm bảo bắt được 100% mã độc. Phòng thủ chính là sandbox + giới hạn tài nguyên.
+    """
+
+    _BLOCK_PATTERNS = [
+        r'\brm\s+-rf\b',
+        r'\bdel\s+/f\b',
+        r'\bformat\s+[a-zA-Z]:\b',
+        r':\(\)\s*\{\s*:\|:\s*&\s*\};:',
+        r'\bcurl\s+[^\n]+\|\s*sh\b',
+        r'\bwget\s+[^\n]+\|\s*sh\b',
+        r'\beval\s*\(',
+        r'\bexec\s*\(',
+        r'base64\.b64decode\(',
+        r'marshal\.loads\(',
+        r'child_process\.exec\(',
+        r'child_process\.execSync\(',
+        r'api\.telegram\.org\/bot',
+        r'BOT_TOKEN',
+        r'TELEGRAM_BOT_TOKEN',
+    ]
+
+    def __init__(self):
+        self._compiled = [re.compile(p, re.IGNORECASE) for p in self._BLOCK_PATTERNS]
+
+    def scan_text(self, name: str, text: str) -> Tuple[bool, str]:
+        for rx in self._compiled:
+            if rx.search(text or ""):
+                return False, f"Phát hiện pattern nguy hiểm: `{rx.pattern}` trong `{name}`"
+        return True, "OK"
+
+    def scan_bytes(self, name: str, data: bytes, max_bytes: int = VIRUS_SCAN_MAX_BYTES) -> Tuple[bool, str]:
+        try:
+            chunk = data[:max_bytes] if data else b""
+            txt = chunk.decode('utf-8', errors='ignore')
+            return self.scan_text(name, txt)
+        except Exception as e:
+            return False, f"Không quét được file: {e}"
+
+malware_guard = MalwareGuard()
+
+# ==================== AUTO RAM JANITOR ====================
+class AutoRamJanitor:
+    def __init__(self):
+        self._last = 0.0
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _do_clean(self):
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                libc.malloc_trim(0)
+        except Exception:
+            pass
+
+    def _loop(self):
+        while True:
+            try:
+                vm = psutil.virtual_memory()
+                now = time.time()
+                if vm.percent >= AUTO_RAM_CLEAN_PERCENT and (now - self._last) >= AUTO_RAM_CLEAN_COOLDOWN:
+                    self._last = now
+                    self._do_clean()
+            except Exception:
+                pass
+            time.sleep(10)
+
+_auto_ram_janitor = AutoRamJanitor()
 # ==================== FILE HANDLER ====================
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
@@ -4980,6 +5283,15 @@ def handle_document(message):
     
     # Kiểm tra suspicious
     check_suspicious(user)
+
+    # Gate coin upload (chống abuse tài nguyên)
+    if (not db.is_admin(user_id)) and user.balance < MIN_COINS_TO_UPLOAD:
+        bot.reply_to(
+            message,
+            f"⛔ Cần tối thiểu `{MIN_COINS_TO_UPLOAD}` coin để upload.\n💰 Số dư hiện tại: `{format_number(user.balance)}`",
+            parse_mode='Markdown'
+        )
+        return
 
     # Anti-spam upload
     ok_up, up_msg = spam_protector.check(user_id, "upload", SPAM_FILE_UPLOAD_LIMIT, SPAM_FILE_UPLOAD_WINDOW)
@@ -5121,6 +5433,17 @@ def handle_zip_file(downloaded_file, file_name, user_id, user_folder, message, s
         with open(zip_path, 'wb') as f:
             f.write(downloaded_file)
         
+
+        # Quét heuristic trên ZIP bytes
+        ok_mz, mz_msg = malware_guard.scan_bytes(file_name, downloaded_file)
+        if not ok_mz:
+            bot.edit_message_text(
+                f"❌ **BỊ CHẶN (MALWARE GUARD)**\n\n{mz_msg}",
+                message.chat.id,
+                status_msg.message_id,
+                parse_mode='Markdown'
+            )
+            return
         # Quét virus/botnet & chống zip-bomb
         ok_zip, zip_msg = file_scanner.scan_zip_safely(zip_path)
         if not ok_zip:
@@ -5310,9 +5633,89 @@ def handle_zip_file(downloaded_file, file_name, user_id, user_folder, message, s
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+# ==================== HEALTH CHECK SERVER ====================
+# Nhiều nền tảng host (Render/Koyeb/Railway/...) chạy "TCP/HTTP health check" vào 1 cổng (thường là 8000).
+# Bot Telegram chạy polling sẽ KHÔNG tự mở cổng => bị restart liên tục (log: TCP health check failed).
+_HEALTH_SERVER = None
+
+def start_health_server():
+    """Mở 1 HTTP server siêu nhẹ để pass health check của host."""
+    global _HEALTH_SERVER
+
+    # Ưu tiên PORT của host, fallback 8000 (đúng với log bạn gửi)
+    try:
+        port = int(os.getenv("PORT", "8000"))
+    except Exception:
+        port = 8000
+
+    host = "0.0.0.0"
+
+    try:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    except Exception:
+        # Fallback cho Python cũ
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from socketserver import ThreadingMixIn
+
+        class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            except Exception:
+                pass
+
+        def do_HEAD(self):
+            try:
+                self.send_response(200)
+                self.end_headers()
+            except Exception:
+                pass
+
+        def log_message(self, format, *args):
+            # tắt log request để đỡ spam
+            return
+
+    try:
+        _HEALTH_SERVER = ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        logger.warning(f"⚠️ Không thể mở health server tại {host}:{port}: {e}")
+        _HEALTH_SERVER = None
+        return None
+
+    t = threading.Thread(target=_HEALTH_SERVER.serve_forever, daemon=True)
+    t.start()
+    logger.info(f"🌐 Health server listening on {host}:{port}")
+    return _HEALTH_SERVER
+
+def stop_health_server():
+    global _HEALTH_SERVER
+    if _HEALTH_SERVER:
+        try:
+            _HEALTH_SERVER.shutdown()
+        except Exception:
+            pass
+        try:
+            _HEALTH_SERVER.server_close()
+        except Exception:
+            pass
+        _HEALTH_SERVER = None
+
+
 # ==================== CLEANUP ====================
 def cleanup():
     logger.info("🧹 Đang dọn dẹp...")
+
+    # Tắt health server (nếu có)
+    try:
+        stop_health_server()
+    except Exception:
+        pass
     
     # Dừng tất cả scripts
     running = script_manager.get_all_running()
@@ -5369,27 +5772,43 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Chạy bot với retry
-    retry_count = 0
-    max_retries = 10
-    
-    while retry_count < max_retries:
+    # Start health server để pass TCP/HTTP health check của host
+# (Nếu host không cần, nó vẫn chạy nhẹ và không ảnh hưởng)
+start_health_server()
+
+# Chạy bot (auto-retry vô hạn + backoff) để hạn chế "crash"
+retry_count = 0
+backoff = 5  # seconds
+
+while True:
+    try:
+        logger.info("🚀 Bắt đầu polling...")
+
+        # Thử skip_pending nếu thư viện hỗ trợ (tránh xử lý backlog khi restart)
         try:
-            logger.info("🚀 Bắt đầu polling...")
+            bot.infinity_polling(timeout=60, long_polling_timeout=30, skip_pending=True)
+        except TypeError:
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
-        except requests.exceptions.ReadTimeout:
-            logger.warning("⏰ Read timeout, khởi động lại polling...")
-            time.sleep(5)
-            retry_count += 1
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"🔌 Lỗi kết nối: {e}")
-            time.sleep(15)
-            retry_count += 1
-        except Exception as e:
-            logger.critical(f"💥 Lỗi nghiêm trọng: {e}", exc_info=True)
-            time.sleep(30)
-            retry_count += 1
-        
-        if retry_count >= max_retries:
-            logger.critical("❌ Quá số lần thử, thoát!")
-            break
+
+        # Nếu polling thoát ra (hiếm), reset backoff và chạy lại
+        retry_count = 0
+        backoff = 5
+        time.sleep(1)
+
+    except requests.exceptions.ReadTimeout:
+        retry_count += 1
+        logger.warning(f"⏰ Read timeout (lần {retry_count}), khởi động lại polling sau {backoff}s...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+    except requests.exceptions.ConnectionError as e:
+        retry_count += 1
+        logger.error(f"🔌 Lỗi kết nối (lần {retry_count}): {e}. Thử lại sau {backoff}s...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+    except Exception as e:
+        retry_count += 1
+        logger.critical(f"💥 Lỗi nghiêm trọng (lần {retry_count}): {e}", exc_info=True)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
