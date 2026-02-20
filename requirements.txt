@@ -1,5 +1,4 @@
 flask
-threading
 aiohttp
 telethon
 python-dotenv
