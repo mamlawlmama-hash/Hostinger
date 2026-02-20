@@ -41,13 +41,10 @@ import traceback
 # ⚠️ Khuyến nghị: đặt token qua biến môi trường để tránh lộ token khi share code
 # Linux/Mac:  export BOT_TOKEN="123:ABC..."
 # Windows:    setx BOT_TOKEN "123:ABC..."
-TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOKEN") or ""
-OWNER_ID = int(os.getenv("OWNER_ID", "8208489603"))
-YOUR_USERNAME = os.getenv("YOUR_USERNAME", "@taolailove2")
+TOKEN ="8505111864:AAFXhTkT5scTv4ulEFpgpxoVYqEGnogoF1k"
+OWNER_ID = "8208489603"
+YOUR_USERNAME = "@taolailove2"
 
-if not TOKEN:
-    raise RuntimeError("❌ Thiếu BOT_TOKEN/TELEGRAM_BOT_TOKEN. Hãy set biến môi trường chứa token bot Telegram.")
-# Cấu hình thư mục
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
 IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
